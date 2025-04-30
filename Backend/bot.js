@@ -1,39 +1,153 @@
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
 const WebSocket = require('ws');
 const http = require('http');
 
-// Optional: Create HTTP server for future expansion (health check, REST endpoints, etc.)
-const server = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('WebSocket Server Running');
+// Discord bot setup
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.Channel]
 });
 
+const token = 'MTM2NjQ5ODU3ODgyMjA3MDMyMw.Gts-Uk.bPHQnSjoTNHpiwiteRbnxYhktvN7LOVuF1AVNk'; // 🔐 Replace with your actual token
+
+// WebSocket + HTTP server setup
+const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-wss.on('connection', (ws) => {
-  console.log('Client connected');
+const clients = new Map(); // Map ws => { guildId, channelId }
 
-  ws.on('message', (data) => {
+// Broadcast a message to all clients watching a specific channel
+function broadcastToChannel(guildId, channelId, message) {
+  const payload = JSON.stringify(message);
+  for (const [ws, info] of clients.entries()) {
+    if (
+      info.guildId === guildId &&
+      info.channelId === channelId &&
+      ws.readyState === WebSocket.OPEN
+    ) {
+      ws.send(payload);
+    }
+  }
+}
+
+// Discord bot event handlers
+client.on('ready', () => {
+  console.log(`✅ Bot logged in as ${client.user.tag}`);
+});
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+
+  broadcastToChannel(message.guildId, message.channelId, {
+    author: {
+      username: message.author.username,
+      id: message.author.id,
+      avatar: message.author.displayAvatarURL({ size: 64 })
+    },
+    content: message.content,
+    timestamp: message.createdAt
+  });
+});
+
+// WebSocket handling
+wss.on('connection', async (ws) => {
+  console.log('🔌 WebSocket client connected');
+
+  const guilds = client.guilds.cache.map(guild => ({
+    id: guild.id,
+    name: guild.name
+  }));
+  ws.send(JSON.stringify({ type: 'guildList', guilds }));
+
+  ws.on('message', async (data) => {
     try {
-      const message = JSON.parse(data);
-      console.log('Received:', message);
+      const msg = JSON.parse(data);
 
-      // Broadcast the message to all connected clients
-      wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify(message));
+      if (msg.type === 'selectGuild') {
+        const guild = client.guilds.cache.get(msg.guildId);
+        if (!guild) return;
+
+        const channels = guild.channels.cache
+          .filter(c => c.isTextBased() && c.viewable)
+          .map(c => ({ id: c.id, name: c.name }));
+
+        ws.send(JSON.stringify({ type: 'channelList', channels }));
+      }
+
+      if (msg.type === 'selectChannel') {
+        clients.set(ws, { guildId: msg.guildId, channelId: msg.channelId });
+        ws.send(JSON.stringify({ type: 'joined', guildId: msg.guildId, channelId: msg.channelId }));
+      }
+
+      if (msg.type === 'chat') {
+        const { guildId, channelId } = clients.get(ws) || {};
+        if (!guildId || !channelId) return;
+
+        const channel = await client.channels.fetch(channelId);
+        if (channel && channel.isTextBased()) {
+          await channel.send(msg.content);
         }
-      });
+      }
     } catch (err) {
-      console.error('Invalid message:', err);
+      console.error('❌ Error handling WS message:', err);
     }
   });
 
   ws.on('close', () => {
-    console.log('Client disconnected');
+    clients.delete(ws);
+    console.log('🔌 WebSocket client disconnected');
   });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`WebSocket server is running on ws://localhost:${PORT}`);
+// HTTP POST /send route
+app.post('/send', async (req, res) => {
+  const { channelId, message } = req.body;
+
+  if (!channelId || !message) {
+    return res.status(400).json({ error: 'Missing channelId or message' });
+  }
+
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel || !channel.isTextBased()) {
+      return res.status(404).json({ error: 'Invalid channel' });
+    }
+
+    const sent = await channel.send(message);
+
+    const payload = {
+      id: sent.id,
+      content: sent.content,
+      timestamp: sent.createdAt.toISOString(),
+      author: {
+        id: sent.author.id,
+        username: sent.author.username,
+        avatar: sent.author.displayAvatarURL({ size: 64 })
+      }
+    };
+
+    broadcastToChannel(channel.guildId, channelId, payload);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('❌ Send error:', err);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
 });
+
+// Start server
+const PORT = 3000;
+server.listen(PORT, () => {
+  console.log(`🚀 Server listening on http://localhost:${PORT}`);
+});
+
+// Start bot
+client.login(token);
