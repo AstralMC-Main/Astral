@@ -90,10 +90,41 @@ wss.on('connection', async (ws) => {
       if (msg.type === 'chat') {
         const { guildId, channelId } = clients.get(ws) || {};
         if (!guildId || !channelId) return;
-
+      
         const channel = await client.channels.fetch(channelId);
         if (channel && channel.isTextBased()) {
-          await channel.send(msg.content);
+          const sent = await channel.send(msg.content);
+      
+          // Echo the message back to all clients in this channel (including sender)
+          const payload = {
+            author: {
+              username: sent.author.username,
+              id: sent.author.id,
+              avatar: sent.author.displayAvatarURL({ size: 64 })
+            },
+            content: sent.content,
+            timestamp: sent.createdAt
+          };
+      
+          broadcastToChannel(guildId, channelId, payload);
+        }
+      }
+      
+      if (msg.type === 'getMessages') {
+        const channel = await client.channels.fetch(msg.channelId);
+        if (channel && channel.isTextBased()) {
+          const messages = await channel.messages.fetch({ limit: 20 });
+          messages.reverse().forEach(message => {
+            ws.send(JSON.stringify({
+              author: {
+                username: message.author.username,
+                id: message.author.id,
+                avatar: message.author.displayAvatarURL({ size: 64 })
+              },
+              content: message.content,
+              timestamp: message.createdAt
+            }));
+          });
         }
       }
     } catch (err) {
@@ -142,6 +173,13 @@ app.post('/send', async (req, res) => {
     res.status(500).json({ error: 'Failed to send message' });
   }
 });
+if (msg.type === 'requestGuildList') {
+  const guilds = client.guilds.cache.map(guild => ({
+    id: guild.id,
+    name: guild.name
+  }));
+  ws.send(JSON.stringify({ type: 'guildList', guilds }));
+}
 
 // Start server
 const PORT = 3000;
