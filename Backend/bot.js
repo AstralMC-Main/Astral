@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const app = express();
 app.use(express.json());
@@ -13,10 +14,10 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent
   ],
-  partials: [Partials.Channel]
+  partials: [Partials.Message, Partials.Channel]
 });
 
-const token = 'MTM2NjQ5ODU3ODgyMjA3MDMyMw.Gts-Uk.bPHQnSjoTNHpiwiteRbnxYhktvN7LOVuF1AVNk'; // 🔐 Replace with your actual token
+const token = process.env.TOKEN;
 
 // WebSocket + HTTP server setup
 const server = http.createServer(app);
@@ -47,6 +48,7 @@ client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
   broadcastToChannel(message.guildId, message.channelId, {
+    id: message.id,
     author: {
       username: message.author.username,
       id: message.author.id,
@@ -54,6 +56,24 @@ client.on('messageCreate', async (message) => {
     },
     content: message.content,
     timestamp: message.createdAt
+  });
+});
+client.on('messageUpdate', (oldMessage, newMessage) => {
+  if (!newMessage.guildId || !newMessage.channelId || newMessage.author?.bot) return;
+
+  // Send update to clients
+  broadcastToChannel(newMessage.guildId, newMessage.channelId, {
+    type: 'edit',
+    id: newMessage.id,
+    content: newMessage.content
+  });
+});
+client.on('messageDelete', (message) => {
+  if (!message.guildId || !message.channelId) return;
+
+  broadcastToChannel(message.guildId, message.channelId, {
+    type: 'delete',
+    id: message.id
   });
 });
 
@@ -70,16 +90,29 @@ wss.on('connection', async (ws) => {
   ws.on('message', async (data) => {
     try {
       const msg = JSON.parse(data);
-
+      if (msg.type === 'requestGuildList') {
+        const guilds = client.guilds.cache.map(guild => ({
+          id: guild.id,
+          name: guild.name
+        }));
+        ws.send(JSON.stringify({ type: 'guildList', guilds }));
+      }
       if (msg.type === 'selectGuild') {
         const guild = client.guilds.cache.get(msg.guildId);
         if (!guild) return;
 
-        const channels = guild.channels.cache
-          .filter(c => c.isTextBased() && c.viewable)
-          .map(c => ({ id: c.id, name: c.name }));
-
-        ws.send(JSON.stringify({ type: 'channelList', channels }));
+        try {
+          const fetchedChannels = await guild.channels.fetch();
+          const channels = Array.from(fetchedChannels.values())
+            .filter(c => c.isTextBased() && c.viewable)
+            .map(c => ({ id: c.id, name: c.name }));
+        
+          ws.send(JSON.stringify({ type: 'channelList', channels }));
+        } catch (err) {
+          console.error('❌ Error fetching channels for guild:', err);
+          ws.send(JSON.stringify({ type: 'error', message: 'Failed to fetch channels' }));
+        }
+        
       }
 
       if (msg.type === 'selectChannel') {
@@ -93,7 +126,13 @@ wss.on('connection', async (ws) => {
       
         const channel = await client.channels.fetch(channelId);
         if (channel && channel.isTextBased()) {
-          const sent = await channel.send(msg.content);
+          const sent = await channel.send({
+            content: msg.content,
+            allowedMentions: {
+              parse: ['users']
+            }
+          });
+          
       
           // Echo the message back to all clients in this channel (including sender)
           const payload = {
@@ -116,6 +155,7 @@ wss.on('connection', async (ws) => {
           const messages = await channel.messages.fetch({ limit: 20 });
           messages.reverse().forEach(message => {
             ws.send(JSON.stringify({
+              id: message.id,
               author: {
                 username: message.author.username,
                 id: message.author.id,
@@ -173,13 +213,7 @@ app.post('/send', async (req, res) => {
     res.status(500).json({ error: 'Failed to send message' });
   }
 });
-if (msg.type === 'requestGuildList') {
-  const guilds = client.guilds.cache.map(guild => ({
-    id: guild.id,
-    name: guild.name
-  }));
-  ws.send(JSON.stringify({ type: 'guildList', guilds }));
-}
+
 
 // Start server
 const PORT = 3000;
